@@ -2,7 +2,7 @@
 
 ![Danfo Logo](https://res.cloudinary.com/chudi/image/upload/v1602901743/Layer_1_2x.png)
 
-Danfo is an opinionated wrapper around the [Go AMQP library](http://github.com/streadway/amqp)
+Danfo is an opinionated wrapper built on-top of the [Go AMQP library](http://github.com/streadway/amqp). It provides a declarative API for working with RabbitMQ in Go. 
 
 ## Goals
 
