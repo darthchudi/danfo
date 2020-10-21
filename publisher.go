@@ -14,69 +14,6 @@ type Publisher struct {
 	channel    *amqp.Channel
 }
 
-// AMQPQueueConfig describes the options for declaring an AMQP queue
-type AMQPQueueConfig struct {
-	// The queue name may be empty, in which case the server will generate a unique name
-	// which will be returned in the Name field of Queue struct.
-	name string
-
-	// Durable queues will survive server restarts
-	durable bool
-
-	// Auto-deleted queues will be deleted when there are no remaining bindings.
-	autoDelete bool
-
-	// Exclusive queues are only accessible by the connection that declares them. Exclusive
-	// non-durable queues will be deleted when the connection closes. Channels on other
-	// connections will receive an error when attempting  to declare, bind, consume, purge
-	// or delete a queue with the same name.
-	exclusive bool
-
-	// When noWait is true, the queue will assume to be declared on the server.  A
-	// channel exception will arrive if the conditions are met for existing queues
-	// or attempting to modify an existing queue from a different connection.
-	noWait bool
-
-	// Optional amqp.Table of arguments that are specific to the server's implementation of
-	// the queue can be sent for queues that require extra parameters.
-	args amqp.Table
-}
-
-// AMQPExchangeConfig describes the options for declaring an AMQP exchange
-type AMQPExchangeConfig struct {
-	// Exchange names starting with "amq." are reserved for pre-declared and
-	// standardized exchanges. The client MAY declare an exchange starting with
-	// "amq." if the passive option is set, or the exchange already exists.  Names can
-	// consist of a non-empty sequence of letters, digits, hyphen, underscore,
-	// period, or colon.
-	name string
-
-	// Each exchange belongs to one of a set of exchange kinds/types implemented by
-	// the server. The exchange types define the functionality of the exchange - i.e.
-	// how messages are routed through it. Once an exchange is declared, its type
-	// cannot be changed.  The common types are "direct", "fanout", "topic" and
-	// "headers".
-	exchangeType string
-
-	// Durable exchanges will survive server restarts
-	durable bool
-
-	// Auto-deleted exchanges will be deleted when there are no remaining bindings.
-	autoDelete bool
-
-	// Exchanges declared as `internal` do not accept accept publishes. Internal
-	// exchanges are useful when you wish to implement inter-exchange topologies
-	// that should not be exposed to users of the broker.
-	internal bool
-
-	// When noWait is true, declare without waiting for a confirmation from the server.
-	// The channel may be closed as a result of an error
-	noWait bool
-
-	// Optional amqp.Table of arguments that are specific to the server's implementation of
-	// the exchange can be sent for exchange types that require extra parameters.
-	args amqp.Table
-}
 
 // PublishConfig describes the options for publishing a message
 type PublishConfig struct {
@@ -102,39 +39,39 @@ type PublishConfig struct {
 	immediate bool
 }
 
-// Sets fields in a publish config
+// PublishConfigSetter sets fields in a publish config
 type PublishConfigSetter func(config *PublishConfig)
 
-// NonDurableQueue declares a non durable queue on a publish config.
+// NonDurablePublishQueue declares a non durable queue on a publish config.
 // A non-durable queue will not survive server restarts
-func NonDurableQueue(pConfig *PublishConfig) {
+func NonDurablePublishQueue(pConfig *PublishConfig) {
 	pConfig.queueConfig.durable = false
 }
 
-// AutoDeletedQueue declares an auto-deleted queue on a publish config.
+// AutoDeletedPublishQueue declares an auto-deleted queue on a publish config.
 // An auto-deleted queue will be deleted when there are no remaining consumers or binding
-func AutoDeletedQueue(pConfig *PublishConfig) {
+func AutoDeletedPublishQueue(pConfig *PublishConfig) {
 	pConfig.queueConfig.autoDelete = true
 }
 
-// ExclusiveQueue declares an Exclusive queue on a publish config
+// ExclusivePublishQueue declares an Exclusive queue on a publish config
 // An exclusive queue cannot be accessed by other connections asides
 // from the connection that declares them
-func ExclusiveQueue(pConfig *PublishConfig) {
+func ExclusivePublishQueue(pConfig *PublishConfig) {
 	pConfig.queueConfig.exclusive = true
 }
 
-// NoWaitQueue declares sets the `noWait` option to true. When set
+// NoWaitPublishQueue declares sets the `noWait` option to true. When set
 // the server will not respond to the declare queue call.
 // A channel exception will arrive if the conditions are met
 // for existing queues or attempting to modify an existing queue from
 // a different connection.
-func NoWaitQueue(pConfig *PublishConfig) {
+func NoWaitPublishQueue(pConfig *PublishConfig) {
 	pConfig.queueConfig.noWait = true
 }
 
-// QueueArguments sets the set of arguments for the queue declaration
-func QueueArguments(args amqp.Table) PublishConfigSetter {
+// PublishQueueArguments sets the set of arguments for the queue declaration
+func PublishQueueArguments(args amqp.Table) PublishConfigSetter {
 	return func(pConfig *PublishConfig) {
 		pConfig.queueConfig.args = args
 	}
@@ -194,7 +131,6 @@ func ImmediatePublish(pConfig *PublishConfig) {
 
 // NewPublisher creates a new publisher and initializes its AMQP connection and channel
 func NewPublisher(url string) (*Publisher, error) {
-	publisher := &Publisher{}
 
 	connection, err := amqp.Dial(url)
 
@@ -208,8 +144,10 @@ func NewPublisher(url string) (*Publisher, error) {
 		return nil, err
 	}
 
-	publisher.connection = connection
-	publisher.channel = channel
+	publisher := &Publisher{
+		connection: connection,
+		channel:    channel,
+	}
 
 	return publisher, nil
 }
