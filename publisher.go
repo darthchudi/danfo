@@ -14,14 +14,13 @@ type Publisher struct {
 	channel    *amqp.Channel
 }
 
-
 // PublishConfig describes the options for publishing a message
 type PublishConfig struct {
 	// Describes the queue configuration
-	queueConfig *AMQPQueueConfig
+	queueConfig AMQPQueueConfig
 
 	// Describes the exchange configuration
-	exchangeConfig *AMQPExchangeConfig
+	exchangeConfig AMQPExchangeConfig
 
 	// The tell the exchange where to route the message to
 	routingKey string
@@ -153,6 +152,7 @@ func NewPublisher(url string) (*Publisher, error) {
 }
 
 // Queues places a message on a RabbitMQ Queue, which may have 1 or more consumers listening.
+// It declares the queue before publishing messages
 // Internally it uses the default exchange for sending messages.  The default exchange is a
 // `direct` exchange with no name (empty string) pre-declared by the broker. It has one special
 // property that makes it very useful for simple applications: every queue that is created is
@@ -164,7 +164,7 @@ func (p *Publisher) Queue(
 	message []byte,
 	configSetters ...PublishConfigSetter,
 ) error {
-	queueConfig := &AMQPQueueConfig{
+	queueConfig := AMQPQueueConfig{
 		name:       queueName,
 		durable:    true,
 		autoDelete: false,
@@ -173,15 +173,24 @@ func (p *Publisher) Queue(
 		args:       nil,
 	}
 
-	// We don't need to specify the other exchange properties because the only
-	// relevant exchange property in this context is the exchange name
-	exchangeConfig := &AMQPExchangeConfig{
-		name: DEFAULT_AMQP_EXCHANGE,
+	// The only relevant exchange config field here is the exchange name
+	// because we don't need to declare the exchange; the default exchange
+	// is pre-declared by the broker. The extra fields are added for correctness
+	// and to avoid confusion when reading.
+	exchangeConfig := AMQPExchangeConfig{
+		name:         DEFAULT_AMQP_EXCHANGE,
+		exchangeType: "direct",
+		durable:      true,
+		autoDelete:   false,
+		internal:     false,
+		noWait:       false,
+		args:         nil,
 	}
 
 	config := &PublishConfig{
 		queueConfig:    queueConfig,
 		exchangeConfig: exchangeConfig,
+		routingKey:     queueName, // Queues are bound to the default exchange with their queue name
 		mandatory:      false,
 		immediate:      false,
 	}
@@ -190,7 +199,7 @@ func (p *Publisher) Queue(
 		configSetter(config)
 	}
 
-	queue, err := p.channel.QueueDeclare(
+	_, err := p.channel.QueueDeclare(
 		config.queueConfig.name,
 		config.queueConfig.durable,
 		config.queueConfig.autoDelete,
@@ -202,9 +211,6 @@ func (p *Publisher) Queue(
 	if err != nil {
 		return err
 	}
-
-	// Set the routing key after the queue has been declared
-	config.routingKey = queue.Name
 
 	payload := amqp.Publishing{Body: message}
 
@@ -224,6 +230,7 @@ func (p *Publisher) Queue(
 }
 
 // Emit broadcasts a message to multiple queues,  which may have 1 or more consumers listening.
+// It declares the exchange before publishing messages
 // It publishes messages based on a provided pattern (routing key).
 // Internally, it uses a topic exchange for sending messages.
 // The routing key allows us scope messages only to queues that are bound with a matching "binding key".
@@ -234,7 +241,7 @@ func (p *Publisher) Emit(
 	message []byte,
 	configSetters ...PublishConfigSetter,
 ) error {
-	exchangeConfig := &AMQPExchangeConfig{
+	exchangeConfig := AMQPExchangeConfig{
 		name:         exchangeName,
 		exchangeType: "topic",
 		durable:      true,
