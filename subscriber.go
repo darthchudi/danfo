@@ -13,7 +13,10 @@ type Subscriber struct {
 // SubscribeConfig describes the options for subscribing for messages
 type SubscribeConfig struct {
 	// Describes the queue configuration
-	queueConfig *AMQPQueueConfig
+	queueConfig AMQPQueueConfig
+
+	// Describes the exchange configuration
+	exchangeConfig AMQPExchangeConfig
 
 	// The consumer is identified by a string that is unique and scoped for all
 	// consumers on this channel. An empty string will cause
@@ -153,13 +156,14 @@ func NewSubscriber(url string) (*Subscriber, error) {
 
 // Consume listens for messages on a work queue
 // The assumption behind a work queue is that each task is delivered to exactly one queue
-// We listen for messages using the default exchange, the queue is bound to the
+// We listen for messages using the default exchange, on which every queue is automatically bound to,
+// with the queue's name as the binding key
 func (s *Subscriber) Consume(
 	queueName string,
 	ingester Ingester,
 	configSetters ...SubscribeConfigSetter,
 ) error {
-	queueConfig := &AMQPQueueConfig{
+	queueConfig := AMQPQueueConfig{
 		name:       queueName,
 		durable:    true,
 		autoDelete: false,
@@ -171,6 +175,10 @@ func (s *Subscriber) Consume(
 	config := &SubscribeConfig{
 		queueConfig: queueConfig,
 		consumer:    "",
+		autoAck:     false,
+		exclusive:   false,
+		noWait:      false,
+		args:        nil,
 	}
 
 	for _, configSetter := range configSetters {
@@ -217,7 +225,113 @@ func (s *Subscriber) Consume(
 	return nil
 }
 
-// On listens for messages on a queue, routed through an exchange.
-// It's suitable in a pub-sub context
-func (s *Subscriber) On(exchange string, event string, queueName string) {
+// On listens for broadcast messages sent to a queue, routed via a specified exchange
+// It allows us to listen for messages based on a provided pattern (binding key)
+// Internally, it is bound to a `topic` exchange via the specified binding key
+// Reference: https://www.rabbitmq.com/tutorials/tutorial-five-go.html
+func (s *Subscriber) On(
+	exchangeName string,
+	bindingKey string,
+	queueName string,
+	ingester Ingester,
+	configSetters ...SubscribeConfigSetter,
+) error {
+	queueConfig := AMQPQueueConfig{
+		name:       queueName,
+		durable:    true,
+		autoDelete: false,
+		exclusive:  false,
+		noWait:     false,
+		args:       nil,
+	}
+
+	exchangeConfig := AMQPExchangeConfig{
+		name:         exchangeName,
+		exchangeType: "topic",
+		durable:      true,
+		autoDelete:   false,
+		internal:     false,
+		noWait:       false,
+		args:         nil,
+	}
+
+	config := &SubscribeConfig{
+		queueConfig:    queueConfig,
+		exchangeConfig: exchangeConfig,
+		consumer:       "",
+		autoAck:        false,
+		exclusive:      false,
+		noWait:         false,
+		args:           nil,
+	}
+
+	for _, configSetter := range configSetters {
+		configSetter(config)
+	}
+
+	_, err := s.channel.QueueDeclare(
+		config.queueConfig.name,
+		config.queueConfig.durable,
+		config.queueConfig.autoDelete,
+		config.queueConfig.exclusive,
+		config.queueConfig.noWait,
+		config.queueConfig.args,
+	)
+
+	if err != nil {
+		return err
+	}
+
+	err = s.channel.ExchangeDeclare(
+		config.exchangeConfig.name,
+		config.exchangeConfig.exchangeType,
+		config.exchangeConfig.durable,
+		config.exchangeConfig.autoDelete,
+		config.exchangeConfig.internal,
+		config.exchangeConfig.noWait,
+		config.exchangeConfig.args,
+	)
+
+	if err != nil {
+		return err
+	}
+
+	// Bind the queue to the exchange using the binding key
+	err = s.channel.QueueBind(
+		config.queueConfig.name,
+		bindingKey,
+		config.exchangeConfig.name,
+		false,
+		nil,
+	)
+
+	if err != nil {
+		return err
+	}
+
+	messages, err := s.channel.Consume(
+		config.queueConfig.name,
+		config.consumer,
+		config.autoAck,
+		config.exclusive,
+		false,
+		config.noWait,
+		config.args,
+	)
+
+	if err != nil {
+		return err
+	}
+
+	// Spin up a dedicated go routine for iterating through the messages channel, until the channel closes
+	go func() {
+		for message := range messages {
+			// invoke the ingester in a separate goroutine so that
+			// each ingester runs in isolation and doesn't block new
+			// messages from being read
+			go ingester(message)
+		}
+	}()
+
+	return nil
 }
