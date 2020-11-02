@@ -2,16 +2,21 @@ package danfo
 
 import (
 	"github.com/streadway/amqp"
+	"log"
+	"time"
 )
 
 const (
-	DEFAULT_AMQP_EXCHANGE = ""
+	defaultAMQPExchange = ""
 )
 
 // Publisher publishes messages to RabbitMQ
 type Publisher struct {
-	connection *amqp.Connection
-	channel    *amqp.Channel
+	Connection          *amqp.Connection
+	Channel             *amqp.Channel
+	NotifyCloseListener chan *amqp.Error
+	IsConnected         bool
+	ReconnectionDelay time.Duration
 }
 
 // PublishConfig describes the options for publishing a message
@@ -128,6 +133,45 @@ func ImmediatePublish(pConfig *PublishConfig) {
 	pConfig.immediate = true
 }
 
+// handlePublisherReconnection listens for connection errors on a publisher and handles the reconnection logic
+func handlePublisherReconnection(p *Publisher, url string){
+	<- p.NotifyCloseListener
+
+	p.IsConnected = false
+
+	// Loop infinitely until we reconnect
+	for {
+		connection, err := amqp.Dial(url)
+
+		if err != nil {
+			log.Printf("danfo: reconnection failed: %v", err)
+			log.Printf("Sleeping for %v seconds, before retrying", p.ReconnectionDelay.String())
+			time.Sleep(p.ReconnectionDelay)
+			continue
+		}
+
+		channel, err := connection.Channel()
+
+		if err != nil {
+			log.Printf("danfo: reconnection failed: %v", err)
+			log.Printf("Sleeping for %v seconds, before retrying", p.ReconnectionDelay.String())
+			time.Sleep(p.ReconnectionDelay)
+			continue
+		}
+
+		// Update channel, connection and listener
+		p.Connection = connection
+		p.Channel = channel
+		p.NotifyCloseListener = make(chan *amqp.Error)
+		p.Channel.NotifyClose(p.NotifyCloseListener)
+		p.IsConnected = true
+		break
+	}
+
+	// Schedule a new reconnection goroutine on the new connection/channel after a successful reconnection
+	go handlePublisherReconnection(p, url)
+}
+
 // NewPublisher creates a new publisher and initializes its AMQP connection and channel
 func NewPublisher(url string) (*Publisher, error) {
 
@@ -144,9 +188,16 @@ func NewPublisher(url string) (*Publisher, error) {
 	}
 
 	publisher := &Publisher{
-		connection: connection,
-		channel:    channel,
+		Connection:          connection,
+		Channel:             channel,
+		NotifyCloseListener: make(chan *amqp.Error),
+		IsConnected:         true,
+		ReconnectionDelay: time.Second * 10,
 	}
+
+	_ = channel.NotifyClose(publisher.NotifyCloseListener)
+
+	go handlePublisherReconnection(publisher, url)
 
 	return publisher, nil
 }
@@ -178,7 +229,7 @@ func (p *Publisher) Queue(
 	// is pre-declared by the broker. The extra fields are added for correctness
 	// and to avoid confusion when reading.
 	exchangeConfig := AMQPExchangeConfig{
-		name:         DEFAULT_AMQP_EXCHANGE,
+		name:         defaultAMQPExchange,
 		exchangeType: "direct",
 		durable:      true,
 		autoDelete:   false,
@@ -199,7 +250,7 @@ func (p *Publisher) Queue(
 		configSetter(config)
 	}
 
-	_, err := p.channel.QueueDeclare(
+	_, err := p.Channel.QueueDeclare(
 		config.queueConfig.name,
 		config.queueConfig.durable,
 		config.queueConfig.autoDelete,
@@ -214,7 +265,7 @@ func (p *Publisher) Queue(
 
 	payload := amqp.Publishing{Body: message}
 
-	err = p.channel.Publish(
+	err = p.Channel.Publish(
 		config.exchangeConfig.name,
 		config.routingKey,
 		config.mandatory,
@@ -262,7 +313,7 @@ func (p *Publisher) Emit(
 		configSetter(config)
 	}
 
-	err := p.channel.ExchangeDeclare(
+	err := p.Channel.ExchangeDeclare(
 		config.exchangeConfig.name,
 		config.exchangeConfig.exchangeType,
 		config.exchangeConfig.durable,
@@ -278,7 +329,7 @@ func (p *Publisher) Emit(
 
 	payload := amqp.Publishing{Body: message}
 
-	err = p.channel.Publish(
+	err = p.Channel.Publish(
 		config.exchangeConfig.name,
 		config.routingKey,
 		config.mandatory,
