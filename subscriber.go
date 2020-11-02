@@ -360,3 +360,9 @@ func (s *Subscriber) On(
 
 	return messages, nil
 }
+
+// Qos controls how many messages or how many bytes the server will try to
+// keep on the network for consumers before receiving delivery acks.
+func (s *Subscriber) Qos(prefetchCount, prefetchSize int, global bool) error {
+	return s.Channel.Qos(prefetchCount, prefetchSize, global)
+}
