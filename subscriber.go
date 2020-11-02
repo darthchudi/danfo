@@ -2,12 +2,17 @@ package danfo
 
 import (
 	"github.com/streadway/amqp"
+	"log"
+	"time"
 )
 
 // Subscriber listens for messages on a RabbitMQ Queue
 type Subscriber struct {
-	connection *amqp.Connection
-	channel    *amqp.Channel
+	Connection          *amqp.Connection
+	Channel             *amqp.Channel
+	NotifyCloseListener chan *amqp.Error
+	IsConnected         bool
+	ReconnectionDelay   time.Duration
 }
 
 // SubscribeConfig describes the options for subscribing for messages
@@ -45,9 +50,6 @@ type SubscribeConfig struct {
 	// or server.
 	args amqp.Table
 }
-
-// Ingester is a function/callback that receives RabbitMQ deliveries and handles them
-type Ingester func(delivery amqp.Delivery)
 
 // SubscribeConfigSetter sets fields in a subscribe config
 type SubscribeConfigSetter func(sConfig *SubscribeConfig)
@@ -132,6 +134,45 @@ func ConsumerArguments(args amqp.Table) SubscribeConfigSetter {
 	}
 }
 
+// handleSubscriberReconnection listens for connection errors on a subscriber and handles the reconnection logic
+func handleSubscriberReconnection(s *Subscriber, url string) {
+	<-s.NotifyCloseListener
+
+	s.IsConnected = false
+
+	// Loop infinitely until we reconnect
+	for {
+		connection, err := amqp.Dial(url)
+
+		if err != nil {
+			log.Printf("danfo: reconnection failed: %v", err)
+			log.Printf("Sleeping for %v seconds, before retrying", s.ReconnectionDelay.String())
+			time.Sleep(s.ReconnectionDelay)
+			continue
+		}
+
+		channel, err := connection.Channel()
+
+		if err != nil {
+			log.Printf("danfo: reconnection failed: %v", err)
+			log.Printf("Sleeping for %v seconds, before retrying", s.ReconnectionDelay.String())
+			time.Sleep(s.ReconnectionDelay)
+			continue
+		}
+
+		// Update channel, connection and listener
+		s.Connection = connection
+		s.Channel = channel
+		s.NotifyCloseListener = make(chan *amqp.Error)
+		s.Channel.NotifyClose(s.NotifyCloseListener)
+		s.IsConnected = true
+		break
+	}
+
+	// Schedule a new reconnection goroutine on the new connection/channel after a successful reconnection
+	go handleSubscriberReconnection(s, url)
+}
+
 // NewSubscriber creates a new subscriber which listens for messages on queues
 func NewSubscriber(url string) (*Subscriber, error) {
 	connection, err := amqp.Dial(url)
@@ -147,22 +188,27 @@ func NewSubscriber(url string) (*Subscriber, error) {
 	}
 
 	subscriber := &Subscriber{
-		connection: connection,
-		channel:    channel,
+		Connection:          connection,
+		Channel:             channel,
+		NotifyCloseListener: make(chan *amqp.Error),
+		IsConnected:         true,
+		ReconnectionDelay:   time.Second * 10,
 	}
+
+	_ = channel.NotifyClose(subscriber.NotifyCloseListener)
+
+	go handleSubscriberReconnection(subscriber, url)
 
 	return subscriber, nil
 }
 
-// Consume listens for messages on a work queue
-// The assumption behind a work queue is that each task is delivered to exactly one queue
+// Consume listens for messages on a queue
 // We listen for messages using the default exchange, on which every queue is automatically bound to,
 // with the queue's name as the binding key
 func (s *Subscriber) Consume(
 	queueName string,
-	ingester Ingester,
 	configSetters ...SubscribeConfigSetter,
-) error {
+) (<-chan amqp.Delivery, error) {
 	queueConfig := AMQPQueueConfig{
 		name:       queueName,
 		durable:    true,
@@ -185,7 +231,7 @@ func (s *Subscriber) Consume(
 		configSetter(config)
 	}
 
-	_, err := s.channel.QueueDeclare(
+	_, err := s.Channel.QueueDeclare(
 		config.queueConfig.name,
 		config.queueConfig.durable,
 		config.queueConfig.autoDelete,
@@ -195,10 +241,10 @@ func (s *Subscriber) Consume(
 	)
 
 	if err != nil {
-		return err
+		return nil, err
 	}
 
-	messages, err := s.channel.Consume(
+	messages, err := s.Channel.Consume(
 		config.queueConfig.name,
 		config.consumer,
 		config.autoAck,
@@ -209,20 +255,10 @@ func (s *Subscriber) Consume(
 	)
 
 	if err != nil {
-		return err
+		return nil, err
 	}
 
-	// Spin up a dedicated go routine for reading the messages until the channel closes
-	go func() {
-		for message := range messages {
-			// invoke the ingester in a separate goroutine so that
-			// each ingester runs in isolation and doesn't block new
-			// messages from being read
-			go ingester(message)
-		}
-	}()
-
-	return nil
+	return messages, nil
 }
 
 // On listens for broadcast messages sent to a queue, routed via a specified exchange
@@ -233,9 +269,8 @@ func (s *Subscriber) On(
 	exchangeName string,
 	bindingKey string,
 	queueName string,
-	ingester Ingester,
 	configSetters ...SubscribeConfigSetter,
-) error {
+) (<-chan amqp.Delivery, error) {
 	queueConfig := AMQPQueueConfig{
 		name:       queueName,
 		durable:    true,
@@ -269,7 +304,7 @@ func (s *Subscriber) On(
 		configSetter(config)
 	}
 
-	_, err := s.channel.QueueDeclare(
+	_, err := s.Channel.QueueDeclare(
 		config.queueConfig.name,
 		config.queueConfig.durable,
 		config.queueConfig.autoDelete,
@@ -279,10 +314,10 @@ func (s *Subscriber) On(
 	)
 
 	if err != nil {
-		return err
+		return nil, err
 	}
 
-	err = s.channel.ExchangeDeclare(
+	err = s.Channel.ExchangeDeclare(
 		config.exchangeConfig.name,
 		config.exchangeConfig.exchangeType,
 		config.exchangeConfig.durable,
@@ -293,11 +328,11 @@ func (s *Subscriber) On(
 	)
 
 	if err != nil {
-		return err
+		return nil, err
 	}
 
 	// Bind the queue to the exchange using the binding key
-	err = s.channel.QueueBind(
+	err = s.Channel.QueueBind(
 		config.queueConfig.name,
 		bindingKey,
 		config.exchangeConfig.name,
@@ -306,10 +341,10 @@ func (s *Subscriber) On(
 	)
 
 	if err != nil {
-		return err
+		return nil, err
 	}
 
-	messages, err := s.channel.Consume(
+	messages, err := s.Channel.Consume(
 		config.queueConfig.name,
 		config.consumer,
 		config.autoAck,
@@ -320,18 +355,8 @@ func (s *Subscriber) On(
 	)
 
 	if err != nil {
-		return err
+		return nil, err
 	}
 
-	// Spin up a dedicated go routine for iterating through the messages channel, until the channel closes
-	go func() {
-		for message := range messages {
-			// invoke the ingester in a separate goroutine so that
-			// each ingester runs in isolation and doesn't block new
-			// messages from being read
-			go ingester(message)
-		}
-	}()
-
-	return nil
+	return messages, nil
 }
