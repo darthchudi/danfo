@@ -7,7 +7,7 @@ import (
 )
 
 const (
-	DEFAULT_AMQP_EXCHANGE = ""
+	defaultAMQPExchange = ""
 )
 
 // Publisher publishes messages to RabbitMQ
@@ -133,8 +133,8 @@ func ImmediatePublish(pConfig *PublishConfig) {
 	pConfig.immediate = true
 }
 
-// handleReconnection listens for connection errors on a publisher and handles the reconnection logic
-func handleReconnection(p *Publisher, url string){
+// handlePublisherReconnection listens for connection errors on a publisher and handles the reconnection logic
+func handlePublisherReconnection(p *Publisher, url string){
 	<- p.NotifyCloseListener
 
 	p.IsConnected = false
@@ -168,9 +168,8 @@ func handleReconnection(p *Publisher, url string){
 		break
 	}
 
-
 	// Schedule a new reconnection goroutine on the new connection/channel after a successful reconnection
-	go handleReconnection(p, url)
+	go handlePublisherReconnection(p, url)
 }
 
 // NewPublisher creates a new publisher and initializes its AMQP connection and channel
@@ -198,7 +197,7 @@ func NewPublisher(url string) (*Publisher, error) {
 
 	_ = channel.NotifyClose(publisher.NotifyCloseListener)
 
-	go handleReconnection(publisher, url)
+	go handlePublisherReconnection(publisher, url)
 
 	return publisher, nil
 }
@@ -230,7 +229,7 @@ func (p *Publisher) Queue(
 	// is pre-declared by the broker. The extra fields are added for correctness
 	// and to avoid confusion when reading.
 	exchangeConfig := AMQPExchangeConfig{
-		name:         DEFAULT_AMQP_EXCHANGE,
+		name:         defaultAMQPExchange,
 		exchangeType: "direct",
 		durable:      true,
 		autoDelete:   false,
