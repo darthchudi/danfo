@@ -6,13 +6,35 @@ import (
 	"time"
 )
 
+// Subscription describes a call to consume messages from a queue, either directly via `.Consume()`
+// or through an exchange with `.On()`.
+// It is an abstraction that allows us to continue streaming messages from a queue after we disconnect from the
+// RabbitMQ broker (because of an error) and successfully reconnect.
+//
+// It holds the config options used to originally subscribe to messages on the queue and the channel returned to the caller
+// of a subscription (`.Consume()`, `.On()`)
+type Subscription struct {
+	channel         *amqp.Channel
+	messages        chan amqp.Delivery
+	config          *SubscribeConfig
+	declareExchange bool
+}
+
+// stream reads messages from a source channel into an internal channel until the source
+// is closed, typically due to an exception/error on the connection
+func (s Subscription) stream(src <-chan amqp.Delivery) {
+	for message := range src {
+		s.messages <- message
+	}
+}
+
 // Subscriber listens for messages on a RabbitMQ Queue
 type Subscriber struct {
 	Connection          *amqp.Connection
-	Channel             *amqp.Channel
 	NotifyCloseListener chan *amqp.Error
 	IsConnected         bool
 	ReconnectionDelay   time.Duration
+	subscriptions       []*Subscription
 }
 
 // SubscribeConfig describes the options for subscribing for messages
@@ -49,6 +71,9 @@ type SubscribeConfig struct {
 	// Optional arguments can be provided that have specific semantics for the queue
 	// or server.
 	args amqp.Table
+
+	// TODO: write description
+	bindingKey string
 }
 
 // SubscribeConfigSetter sets fields in a subscribe config
@@ -134,11 +159,118 @@ func ConsumerArguments(args amqp.Table) SubscribeConfigSetter {
 	}
 }
 
-// handleSubscriberReconnection listens for connection errors on a subscriber and handles the reconnection logic
-func handleSubscriberReconnection(s *Subscriber, url string) {
+// restartSubscriptions continues streaming messages on all subscriptions on the subscriber after
+// a successful reconnection
+func (s *Subscriber) restartSubscriptions() error {
+	for _, subscription := range s.subscriptions {
+		// Create a new channel scoped to the subscription
+		channel, err := s.Connection.Channel()
+
+		if err != nil{
+			return err
+		}
+
+		_, err = channel.QueueDeclare(
+			subscription.config.queueConfig.name,
+			subscription.config.queueConfig.durable,
+			subscription.config.queueConfig.autoDelete,
+			subscription.config.queueConfig.exclusive,
+			subscription.config.queueConfig.noWait,
+			subscription.config.queueConfig.args,
+		)
+
+		if err != nil {
+			return err
+		}
+
+		// If the subscription consumes messages from the queue via a named exchange i.e
+		// with a call to `On()`, we will need to redeclare the exchange and bind the queue to
+		// the exchange
+		if subscription.declareExchange {
+			err = channel.ExchangeDeclare(
+				subscription.config.exchangeConfig.name,
+				subscription.config.exchangeConfig.exchangeType,
+				subscription.config.exchangeConfig.durable,
+				subscription.config.exchangeConfig.autoDelete,
+				subscription.config.exchangeConfig.internal,
+				subscription.config.exchangeConfig.noWait,
+				subscription.config.exchangeConfig.args,
+			)
+
+			if err != nil {
+				return err
+			}
+
+			// Bind the queue to the exchange using the binding key
+			err = channel.QueueBind(
+				subscription.config.queueConfig.name,
+				subscription.config.bindingKey,
+				subscription.config.exchangeConfig.name,
+				false,
+				nil,
+			)
+
+			if err != nil {
+				return err
+			}
+		}
+
+		// Consume from the queue
+		src, err := channel.Consume(
+			subscription.config.queueConfig.name,
+			subscription.config.consumer,
+			subscription.config.autoAck,
+			subscription.config.exclusive,
+			false,
+			subscription.config.noWait,
+			subscription.config.args,
+		)
+
+		if err != nil {
+			return err
+		}
+
+		// Update the subscription's channel
+		subscription.channel = channel
+
+		// Resume streaming messages from a source messages channel
+		go subscription.stream(src)
+	}
+
+	return nil
+}
+
+// NewSubscriber creates a new subscriber which listens for messages on queues
+func NewSubscriber(url string) (*Subscriber, error) {
+	connection, err := amqp.Dial(url)
+
+	if err != nil {
+		return nil, err
+	}
+
+	subscriber := &Subscriber{
+		Connection:          connection,
+		NotifyCloseListener: make(chan *amqp.Error),
+		IsConnected:         true,
+		ReconnectionDelay:   time.Second * 10,
+	}
+
+	// Register a listener for exceptions thrown on the connection by the server
+	_ = subscriber.Connection.NotifyClose(subscriber.NotifyCloseListener)
+
+	go subscriber.reconnectOnConnectionError(url)
+
+	return subscriber, nil
+}
+
+// reconnectOnConnectionError listens for connection errors/exceptions from the server and
+// attempts to reconnect to the server
+func (s *Subscriber) reconnectOnConnectionError(url string) {
 	<-s.NotifyCloseListener
 
 	s.IsConnected = false
+
+	log.Printf("\n🌻Connection Exception: %+v\n", s)
 
 	// Loop infinitely until we reconnect
 	for {
@@ -151,55 +283,26 @@ func handleSubscriberReconnection(s *Subscriber, url string) {
 			continue
 		}
 
-		channel, err := connection.Channel()
+		// Update connection and close listener
+		s.Connection = connection
+		s.NotifyCloseListener = make(chan *amqp.Error)
+		s.Connection.NotifyClose(s.NotifyCloseListener)
+		s.IsConnected = true
+
+		log.Print("Subscriber reconnected")
+
+		// Restart subscriptions with the new connection
+		err = s.restartSubscriptions()
 
 		if err != nil {
-			log.Printf("danfo: reconnection failed: %v", err)
-			log.Printf("Sleeping for %v seconds, before retrying", s.ReconnectionDelay.String())
-			time.Sleep(s.ReconnectionDelay)
-			continue
+			log.Printf("danfo: could not restart subscriptions: %v", err)
 		}
 
-		// Update channel, connection and listener
-		s.Connection = connection
-		s.Channel = channel
-		s.NotifyCloseListener = make(chan *amqp.Error)
-		s.Channel.NotifyClose(s.NotifyCloseListener)
-		s.IsConnected = true
 		break
 	}
 
-	// Schedule a new reconnection goroutine on the new connection/channel after a successful reconnection
-	go handleSubscriberReconnection(s, url)
-}
-
-// NewSubscriber creates a new subscriber which listens for messages on queues
-func NewSubscriber(url string) (*Subscriber, error) {
-	connection, err := amqp.Dial(url)
-
-	if err != nil {
-		return nil, err
-	}
-
-	channel, err := connection.Channel()
-
-	if err != nil {
-		return nil, err
-	}
-
-	subscriber := &Subscriber{
-		Connection:          connection,
-		Channel:             channel,
-		NotifyCloseListener: make(chan *amqp.Error),
-		IsConnected:         true,
-		ReconnectionDelay:   time.Second * 10,
-	}
-
-	_ = channel.NotifyClose(subscriber.NotifyCloseListener)
-
-	go handleSubscriberReconnection(subscriber, url)
-
-	return subscriber, nil
+	// Schedule a new reconnection goroutine on the new connection after a successful reconnection
+	go s.reconnectOnConnectionError(url)
 }
 
 // Consume listens for messages on a queue
@@ -231,7 +334,15 @@ func (s *Subscriber) Consume(
 		configSetter(config)
 	}
 
-	_, err := s.Channel.QueueDeclare(
+
+	// Create a new channel scoped to the subscription/consumer
+	channel, err := s.Connection.Channel()
+
+	if err != nil {
+		return nil, err
+	}
+
+	_, err = channel.QueueDeclare(
 		config.queueConfig.name,
 		config.queueConfig.durable,
 		config.queueConfig.autoDelete,
@@ -244,7 +355,7 @@ func (s *Subscriber) Consume(
 		return nil, err
 	}
 
-	messages, err := s.Channel.Consume(
+	src, err := channel.Consume(
 		config.queueConfig.name,
 		config.consumer,
 		config.autoAck,
@@ -258,7 +369,18 @@ func (s *Subscriber) Consume(
 		return nil, err
 	}
 
-	return messages, nil
+	// Create a new subscription registered on the subscriber
+	subscription := &Subscription{
+		messages:        make(chan amqp.Delivery),
+		channel: channel,
+		config:          config,
+		declareExchange: false,
+	}
+	s.subscriptions = append(s.subscriptions, subscription)
+
+	go subscription.stream(src)
+
+	return subscription.messages, nil
 }
 
 // On listens for broadcast messages sent to a queue, routed via a specified exchange
@@ -293,6 +415,7 @@ func (s *Subscriber) On(
 	config := &SubscribeConfig{
 		queueConfig:    queueConfig,
 		exchangeConfig: exchangeConfig,
+		bindingKey:     bindingKey,
 		consumer:       "",
 		autoAck:        false,
 		exclusive:      false,
@@ -304,7 +427,14 @@ func (s *Subscriber) On(
 		configSetter(config)
 	}
 
-	_, err := s.Channel.QueueDeclare(
+	// Create a new channel scoped to the subscription/consumer
+	channel, err := s.Connection.Channel()
+
+	if err != nil {
+		return nil, err
+	}
+
+	_, err = channel.QueueDeclare(
 		config.queueConfig.name,
 		config.queueConfig.durable,
 		config.queueConfig.autoDelete,
@@ -317,7 +447,7 @@ func (s *Subscriber) On(
 		return nil, err
 	}
 
-	err = s.Channel.ExchangeDeclare(
+	err = channel.ExchangeDeclare(
 		config.exchangeConfig.name,
 		config.exchangeConfig.exchangeType,
 		config.exchangeConfig.durable,
@@ -332,9 +462,9 @@ func (s *Subscriber) On(
 	}
 
 	// Bind the queue to the exchange using the binding key
-	err = s.Channel.QueueBind(
+	err = channel.QueueBind(
 		config.queueConfig.name,
-		bindingKey,
+		config.bindingKey,
 		config.exchangeConfig.name,
 		false,
 		nil,
@@ -344,7 +474,7 @@ func (s *Subscriber) On(
 		return nil, err
 	}
 
-	messages, err := s.Channel.Consume(
+	src, err := channel.Consume(
 		config.queueConfig.name,
 		config.consumer,
 		config.autoAck,
@@ -358,11 +488,16 @@ func (s *Subscriber) On(
 		return nil, err
 	}
 
-	return messages, nil
-}
+	// Create a new subscription registered on the subscriber
+	subscription := &Subscription{
+		messages:        make(chan amqp.Delivery),
+		channel:         channel,
+		config:          config,
+		declareExchange: true,
+	}
+	s.subscriptions = append(s.subscriptions, subscription)
 
-// Qos controls how many messages or how many bytes the server will try to
-// keep on the network for consumers before receiving delivery acks.
-func (s *Subscriber) Qos(prefetchCount, prefetchSize int, global bool) error {
-	return s.Channel.Qos(prefetchCount, prefetchSize, global)
+	go subscription.stream(src)
+
+	return subscription.messages, nil
 }
