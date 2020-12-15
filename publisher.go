@@ -227,7 +227,6 @@ func (p *Publisher) Queue(
 	// The only relevant exchange config field here is the exchange name
 	// because we don't need to declare the exchange; the default exchange
 	// is pre-declared by the broker. The extra fields are added for correctness
-	// and to avoid confusion when reading.
 	exchangeConfig := AMQPExchangeConfig{
 		name:         defaultAMQPExchange,
 		exchangeType: "direct",
