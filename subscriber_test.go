@@ -9,7 +9,7 @@ func TestNewSubscriber(t *testing.T) {
 		t.Fatalf("Failed to create subscriber")
 	}
 
-	if !subscriber.IsConnected || subscriber.Connection == nil || subscriber.Channel == nil {
+	if !subscriber.IsConnected || subscriber.Connection == nil {
 		t.Fatal("Subscriber could not connect")
 	}
 }
